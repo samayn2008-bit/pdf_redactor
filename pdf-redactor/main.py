@@ -18,6 +18,7 @@ import tempfile
 import pymupdf
 import shlex
 import sys
+import json
 
 parser = argparse.ArgumentParser(description="Convert a PDF to DOCX and mask sensitive information")
 
@@ -25,6 +26,32 @@ parser = argparse.ArgumentParser(description="Convert a PDF to DOCX and mask sen
 nlp = spacy.load("en_core_web_sm")
 
 placeholder_map = {}
+
+def load_placeholder_map(key_path):
+    if not key_path.exists():
+        return {}
+
+    with key_path.open("r", encoding="utf-8") as key_file:
+        saved_entries = json.load(key_file)
+
+    return {
+        (entry["category"], entry["original_value"]): entry["placeholder"]
+        for entry in saved_entries
+    }
+
+def save_placeholder_map(key_path):
+    saved_entries = [
+        {
+            "category": category,
+            "original_value": original_value,
+            "placeholder": placeholder,
+        }
+        for (category, original_value), placeholder in placeholder_map.items()
+    ]
+
+    with key_path.open("w", encoding="utf-8") as key_file:
+        json.dump(saved_entries, key_file, indent=2)
+
 
 def save_redaction_key(key_path):
     key_document = Document();
@@ -60,7 +87,7 @@ def get_initials(value):
     return "".join(word[0].upper() for word in words[:2])
 
 def get_email_initials(email):
-    local_part = email.split("@", 1) [0]
+    local_part = email.split("@", 1)[0]
 
     words = re.findall(r"[A-Za-z]+", local_part)
 
@@ -90,6 +117,17 @@ def get_placeholder(category, value):
     if key in placeholder_map:
         return placeholder_map[key]
 
+    if category == "PERSON":
+        normalized_value = value.casefold()
+
+        for (stored_category, stored_value), alias in placeholder_map.items():
+            if (
+                stored_category == "PERSON"
+                and stored_value.casefold() == normalized_value
+            ):
+                placeholder_map[key] = alias
+                return alias
+
     if category == "EMAIL":
         initials = get_email_initials(value)
         person_alias = get_person_alias_by_initials(initials)
@@ -97,7 +135,20 @@ def get_placeholder(category, value):
         if person_alias:
             placeholder = f"{person_alias}@example.invalid"
         else:
-            placeholder = f"{initials}1@example.invalid"
+            existing_email_aliases = {
+                alias.split("@", 1)[0]
+                for (stored_category, _), alias in placeholder_map.items()
+                if stored_category == "EMAIL"
+            }
+
+            count = 1
+            candidate = f"{initials}{count}"
+
+            while candidate in existing_email_aliases:
+                count += 1
+                candidate = f"{initials}{count}"
+
+            placeholder = f"{candidate}@example.invalid"
 
         placeholder_map[key] = placeholder
         return placeholder
@@ -222,10 +273,6 @@ def valid_person_name(name):
     if re.search(r"\b(v\.?|vs\.?|versus)\b", name, re.I):
         return False
 
-    #Reject all-uppercase headings and labels
-    if name.isupper():
-        return False
-
     return True
 
 
@@ -233,7 +280,8 @@ def find_sensitive_spans(text):
     patterns = {
         "EMAIL": r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         "PHONE": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
-        "SSN": r"\b\d{3}-\d{2}-\d{4}\b"
+        "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
+        "CASE_NUMBER": r"\bFX[-/]CIV[-/]\d{4}[-/]\d{4}\b"
     }
 
     structured_spans = []
@@ -261,12 +309,27 @@ def find_sensitive_spans(text):
     # 3. Detect potential names
     doc = nlp(analysis_text)
     person_spans = []
+    
+    #Detect plaintiff name in a case caption like (Name v. Corporation)
+    caption_match = re.search(
+        r"(?im)^\s*([A-Z][A-Z]+(?:\s+[A-Z][A-Z]+){1,3})\s+v\.?\s+",
+        text,
+    )
+
+    if caption_match:
+        person_spans.append(
+            (
+                caption_match.start(1),
+                caption_match.end(1),
+                "PERSON",
+            )
+        )
 
     for entity in doc.ents:
         if (entity.label_ != "PERSON"):
             continue;
 
-        entity_text = analysis_text[entity.start_char:entity.end_char]
+        entity_text = analysis_text[entity.start_char:entity.end_char]        
 
         #Split long predictions at field separators
         separators = list(re.finditer(r"\s+-\s+|[;|\n]", entity_text))
@@ -309,6 +372,23 @@ def find_sensitive_spans(text):
 
             person_spans.append((start, end, "PERSON"))
 
+    # Find known person names that spaCy missed
+    known_person_names = [
+        original_value
+        for (category, original_value) in placeholder_map
+        if category == "PERSON"
+    ]
+
+    for original_value in known_person_names:
+        for match in re.finditer(
+            rf"(?<!\w){re.escape(original_value)}(?!\w)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            person_spans.append(
+                (match.start(), match.end(), "PERSON")
+            )
+
     # 4. Combine matches and prioritze structured data
     accepted = structured_spans[:]
 
@@ -322,7 +402,7 @@ def find_sensitive_spans(text):
     # Restore the original document order
     accepted.sort(key=lambda span: span[0])
 
-    # 5. Assign placeholders
+    # 5. Assign placeholders to the initial matches
     numbered_spans = []
 
     for start, end, category in accepted:
@@ -330,6 +410,36 @@ def find_sensitive_spans(text):
         placeholder = get_placeholder(category, original_value)
         numbered_spans.append((start, end, placeholder))
 
+    # 6. Search again using all person names discovered in the paragraph
+    known_person_names = [
+        original_value
+        for (category, original_value) in placeholder_map
+        if category == "PERSON"
+    ]
+
+    for original_value in known_person_names:
+        for match in re.finditer(
+            rf"(?<!\w){re.escape(original_value)}(?!\w)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            start, end = match.span()
+
+            if any(
+                start < existing_end and end > existing_start
+                for existing_start, existing_end, _ in numbered_spans
+            ):
+                continue
+
+            placeholder = get_placeholder(
+                "PERSON",
+                text[start:end],
+            )
+
+            numbered_spans.append((start, end, placeholder))
+
+    numbered_spans.sort(key=lambda span: span[0])
+    
     return numbered_spans
 
 
@@ -387,11 +497,31 @@ def repair_spacing(paragraph):
         if run.text != text:
             run.text = text
 
-parser.add_argument(
+
+# Allow user to upload multiples files
+input_group = parser.add_mutually_exclusive_group(required=True)
+
+input_group.add_argument(
     "-p",
     "--pdf",
-    required=True,
-    help="Path to the PDF file"
+    help = "Path to one PDF file"
+)
+
+input_group.add_argument(
+    "-i",
+    "--input",
+    help="Path to a folder containing PDF files"
+)
+
+parser.add_argument(
+    "-o",
+    "--output",
+    help="Folder where anonymized files should be saved"
+)
+
+parser.add_argument(
+    "--key",
+    help="Path to the persistent redaction mapping JSON file"
 )
 
 def remove_pdf_links(pdf_path, temp_path):
@@ -404,49 +534,82 @@ def remove_pdf_links(pdf_path, temp_path):
 
 args = parser.parse_args();
 
-pdf_path = Path(args.pdf).expanduser().resolve()
-if not pdf_path.is_file():
-    parser.error("The specified file does not exist.")
+if args.pdf:
+    input_path = Path(args.pdf).expanduser().resolve()
 
-if pdf_path.suffix.lower() != ".pdf":
-    parser.error("The specified file must be a PDF.")
+    if not input_path.is_file():
+        parser.error("The specified PDF file does not exist.")
+    
+    if input_path.suffix.lower() != ".pdf":
+        parser.error("The specified file must be a PDF.")
 
-print("Valid PDF file:", pdf_path)
+    pdf_paths = [input_path]
+    default_output_dir = input_path.parent
 
-file_name = pdf_path.stem
-output_name = file_name + "_redacted.docx"
-output_path = pdf_path.with_name(output_name)
+else:
+    input_path = Path(args.input).expanduser().resolve()
 
-print("Input:", pdf_path)
-print("Output:", output_path)
+    if not input_path.is_dir():
+        parser.error("The specified input folder does not exist.")
 
-##temporary directory to remove links
-with tempfile.TemporaryDirectory() as temp_dir:
-    temp_path = Path(temp_dir) / "no_links.pdf"
-    remove_pdf_links(pdf_path, temp_path)
-    converter = Converter(str(temp_path))
+    pdf_paths = sorted(
+        path for path in input_path.iterdir()
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    )
 
-    try:
-        converter.convert(str(output_path))
-    finally:
-        converter.close()
+    if not pdf_paths:
+        parser.error("The input folder contains no PDF files.")
 
-document = Document(output_path)
+    default_output_dir = input_path / "anonymized"
 
-mask_container(document)
+output_dir = (
+    Path(args.output).expanduser().resolve()
+    if args.output
+    else default_output_dir
+)
 
-for section in document.sections:
-    mask_container(section.header)
-    mask_container(section.footer)
+output_dir.mkdir(parents=True, exist_ok=True)
 
-document.save(output_path)
+# Load previously assigned aliases before document scanning
+if args.key:
+    mapping_path = Path(args.key).expanduser().resolve()
+else:
+    mapping_path = output_dir / "case_mapping.json"
 
-key_path = pdf_path.with_name(pdf_path.stem + "_redacted_KEY.docx")
-save_redaction_key(key_path)
+placeholder_map.update(load_placeholder_map(mapping_path))
 
-print("Conversion and masking successful!")
-print("Open redacted document:")
-print(get_open_command(output_path))
+for pdf_path in pdf_paths:
+    print("Processing:", pdf_path)
 
-print("Open redaction key:")
-print(get_open_command(key_path))
+    output_path = output_dir / f"{pdf_path.stem}_redacted.docx"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "no_links.pdf"
+        remove_pdf_links(pdf_path, temp_path)
+        
+        converter = Converter(str(temp_path))
+
+        try:
+            converter.convert(str(output_path))
+        finally:
+            converter.close()
+
+    document = Document(output_path)
+
+    mask_container(document)
+
+    for section in document.sections:
+        mask_container(section.header)
+        mask_container(section.footer)
+
+    document.save(output_path)
+
+    redaction_key_path = (output_dir / f"{pdf_path.stem}_redacted_KEY.docx")
+    
+    save_redaction_key(redaction_key_path)
+    save_placeholder_map(mapping_path)
+
+    print("Created:", output_path)
+
+print("Batch processing complete.")
+print("Shared mapping key:", mapping_path)
