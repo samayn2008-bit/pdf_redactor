@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#
+*_mapping.json
+*_redacted_KEY.docx
+*_redacted.docx
+*.pdf
+__pycache__/
+*.pyc
