@@ -19,6 +19,7 @@ import pymupdf
 import shlex
 import sys
 import json
+from redaction import mapping as mapping_utils
 
 parser = argparse.ArgumentParser(description="Convert a PDF to DOCX and mask sensitive information")
 
@@ -128,12 +129,61 @@ def get_placeholder(category, value):
                 placeholder_map[key] = alias
                 return alias
 
+    if category == "ORGANIZATION":
+        initials = get_initials(value)
+
+        existing_aliases = {
+            alias
+            for (stored_category, _), alias in placeholder_map.items()
+            if stored_category == "ORGANIZATION"
+            and alias.startswith(initials)
+        }
+
+        count = len(existing_aliases) + 1
+        placeholder = f"{initials}{count}"
+
+        placeholder_map[key] = placeholder
+        return placeholder
+
+    if category == "DOB":
+        count = sum(
+            1
+            for stored_category, _ in placeholder_map
+            if stored_category == "DOB"
+        )
+
+        placeholder = f"DOB_{count + 1}"
+        placeholder_map[key] = placeholder
+        return placeholder
+
+    if category == "ADDRESS":
+        count = sum(
+            1
+            for stored_category, _ in placeholder_map
+            if stored_category == "ADDRESS"
+        )
+
+        placeholder = f"ADDRESS_{count + 1}"
+        placeholder_map[key] = placeholder
+        return placeholder
+
+    if category == "LOCATION":
+        count = sum(
+            1
+            for stored_category, _ in placeholder_map
+            if stored_category == "LOCATION"
+        )
+
+        placeholder = f"LOCATION_{count + 1}"
+        placeholder_map[key] = placeholder
+        return placeholder
+
     if category == "EMAIL":
         initials = get_email_initials(value)
         person_alias = get_person_alias_by_initials(initials)
 
         if person_alias:
-            placeholder = f"{person_alias}@example.invalid"
+            placeholder = f"{person_alias}@company.gov"
         else:
             existing_email_aliases = {
                 alias.split("@", 1)[0]
@@ -175,6 +225,24 @@ def get_placeholder(category, value):
     placeholder_map[key] = placeholder
 
     return placeholder
+
+
+# Mapping implementations live in redaction.mapping. Keep the local names
+# as compatibility aliases for callers that import them from main.
+load_placeholder_map = mapping_utils.load_placeholder_map
+save_placeholder_map = lambda key_path: mapping_utils.save_placeholder_map(
+    key_path,
+    placeholder_map,
+)
+save_redaction_key = lambda key_path: mapping_utils.save_redaction_key(
+    key_path,
+    placeholder_map,
+)
+get_placeholder = lambda category, value: mapping_utils.get_placeholder(
+    category,
+    value,
+    placeholder_map,
+)
 
 
 def get_open_command(file_path):
@@ -279,10 +347,39 @@ def valid_person_name(name):
 def find_sensitive_spans(text):
     patterns = {
         "EMAIL": r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-        "PHONE": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
+        "PHONE": r"(?<!\d)(?:\+?1[\s.-]*)?(?:\(\d{3}\)|\d{3})[\s.-]*\d{3}[\s.-]*\d{4}(?!\d)",
         "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
-        "CASE_NUMBER": r"\bFX[-/]CIV[-/]\d{4}[-/]\d{4}\b"
+        "CASE_NUMBER": r"\bFX[-/]CIV[-/]\d{4}[-/]\d{4}\b",
+        "IDENTIFIER": r"\b[A-Z]{2,4}-[A-Z]{2,4}-\d{2,6}\b",
     }
+
+    legal_entity_pattern = re.compile(
+        r"\b[A-Z][A-Za-z&.'-]*(?:\s+[A-Z][A-Za-z&.'-]*){0,6}"
+        r"\s+(?:Inc\.?|LLC|Ltd\.?|Limited|Corporation|Corp\.?|"
+        r"Company|Co\.?|PLC|LP|LLP|P\.C\.|"
+        r"High School|Middle School|Elementary School|School|District|"
+        r"University|College)\b"
+    )
+
+    labeled_dob_patterns = [
+        r"(?i)\b(?:date of birth|dob|born)\s*[:\-]?\s*"
+        r"(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-]\d{2,4}\b",
+        r"(?i)\b(?:date of birth|dob|born)\s*[:\-]?\s*"
+        r"(?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},\s+\d{4}\b",
+    ]
+
+    date_patterns = [
+        r"(?i)\b(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-]\d{2,4}\b",
+        r"(?i)\b(?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},?\s+\d{4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+    ]
+
+    address_pattern = re.compile(
+        r"\b\d{1,6}\s+[^,\n]+(?:,\s*[^,\n]+){1,3},\s*[A-Z]{2}\s+"
+        r"\d{5}(?:-\d{4})?\b"
+    )
 
     structured_spans = []
 
@@ -294,6 +391,46 @@ def find_sensitive_spans(text):
 
             if not any(start < e and e > s for s, e, _ in structured_spans):
                 structured_spans.append((start, end, category))
+
+    for pattern in labeled_dob_patterns:
+        for match in re.finditer(pattern, text):
+            start, end = match.span()
+
+            if not any(
+                start < existing_end and end > existing_start
+                for existing_start, existing_end, _ in structured_spans
+            ):
+                structured_spans.append((start, end, "DOB"))
+
+    if re.search(r"(?i)\b(date of birth|dob|born)\b", text):
+        for pattern in date_patterns:
+            for match in re.finditer(pattern, text):
+                start, end = match.span()
+                if not any(
+                    start < existing_end and end > existing_start
+                    for existing_start, existing_end, _ in structured_spans
+                ):
+                    structured_spans.append((start, end, "DOB"))
+
+    for match in address_pattern.finditer(text):
+        start, end = match.span()
+
+        if not any(
+            start < existing_end and end > existing_start
+            for existing_start, existing_end, _ in structured_spans
+        ):
+            structured_spans.append((start, end, "ADDRESS"))
+
+    for match in legal_entity_pattern.finditer(text):
+        start, end = match.span()
+
+        if not any(
+            start < existing_end and end > existing_start
+            for existing_start, existing_end, _ in structured_spans
+        ):
+            structured_spans.append(
+                (start, end, "ORGANIZATION")
+            )
 
 
     # 2. Prepare text for spaCy without changing offsets
@@ -326,10 +463,50 @@ def find_sensitive_spans(text):
         )
 
     for entity in doc.ents:
-        if (entity.label_ != "PERSON"):
-            continue;
 
-        entity_text = analysis_text[entity.start_char:entity.end_char]        
+        if entity.label_ not in {"PERSON", "ORG", "GPE", "LOC", "FAC"}:
+            continue
+
+        entity_text = analysis_text[entity.start_char:entity.end_char]   
+
+        line_start = text.rfind("\n", 0, entity.start_char) + 1
+        line_end = text.find("\n", entity.end_char)
+        if line_end == -1:
+            line_end = len(text)
+        source_line = text[line_start:line_end].strip()
+
+        if entity_text.strip().isupper() and " v." not in source_line.lower():
+            continue
+
+        if entity_text.casefold().strip() == "social security":
+            continue
+
+        entity_tokens = list(entity)
+        entity_has_legal_suffix = bool(
+            re.search(
+                r"\b(LLC|Inc\.?|Ltd\.?|Limited|Corporation|Corp\.?|"
+                r"District|County|PLC|LP|LLP|P\.C\.)\b",
+                entity_text,
+                re.I,
+            )
+        )
+
+        if entity.label_ != "PERSON":
+            if len(entity_tokens) < 2 and not entity_has_legal_suffix:
+                continue
+
+            if re.match(
+                r"(?i)^(plaintiff|defendant|counsel|attorney|clerk)\b",
+                entity_text.strip(),
+            ):
+                continue
+
+        if entity.label_ == "PERSON":
+            category = "PERSON"
+        elif entity.label_ == "ORG":
+            category = "ORGANIZATION"    
+        else:
+            category = "LOCATION"
 
         #Split long predictions at field separators
         separators = list(re.finditer(r"\s+-\s+|[;|\n]", entity_text))
@@ -350,7 +527,7 @@ def find_sensitive_spans(text):
             chunk = entity_text[local_start:local_end]
             candidate = chunk.strip()
 
-            if not valid_person_name(candidate):
+            if category == "PERSON" and not valid_person_name(candidate):
                 continue
 
             # Translate back to original text positions
@@ -389,15 +566,19 @@ def find_sensitive_spans(text):
                 (match.start(), match.end(), "PERSON")
             )
 
-    # 4. Combine matches and prioritze structured data
-    accepted = structured_spans[:]
+    # 4. Combine matches and keep the longest non-overlapping span
+    candidates = structured_spans + person_spans
+    candidates.sort(key=lambda span: (-(span[1] - span[0]), span[0]))
 
-    for start, end, category in person_spans:
-        if not any(
-            start < e and end > s
-            for s, e, _ in accepted
+    accepted = []
+    for start, end, category in candidates:
+        if any(
+            start < existing_end and end > existing_start
+            for existing_start, existing_end, _ in accepted
         ):
-            accepted.append((start, end, category))
+            continue
+
+        accepted.append((start, end, category))
 
     # Restore the original document order
     accepted.sort(key=lambda span: span[0])
@@ -576,7 +757,7 @@ if args.key:
 else:
     mapping_path = output_dir / "case_mapping.json"
 
-placeholder_map.update(load_placeholder_map(mapping_path))
+placeholder_map.update(mapping_utils.load_placeholder_map(mapping_path))
 
 for pdf_path in pdf_paths:
     print("Processing:", pdf_path)
@@ -606,8 +787,8 @@ for pdf_path in pdf_paths:
 
     redaction_key_path = (output_dir / f"{pdf_path.stem}_redacted_KEY.docx")
     
-    save_redaction_key(redaction_key_path)
-    save_placeholder_map(mapping_path)
+    mapping_utils.save_redaction_key(redaction_key_path, placeholder_map)
+    mapping_utils.save_placeholder_map(mapping_path, placeholder_map)
 
     print("Created:", output_path)
 
