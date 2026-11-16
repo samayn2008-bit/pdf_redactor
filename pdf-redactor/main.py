@@ -337,6 +337,12 @@ def valid_person_name(name):
     if "@" in name or " - " in name or "|" in name or ";" in name:
         return False
 
+    if re.search(r"(?i)\b(and|or|the|of|with|unless)\b", name):
+        return False
+
+    if re.search(r"(?i)[’']s\b", name):
+        return False
+
     # Reject legal case titles
     if re.search(r"\b(v\.?|vs\.?|versus)\b", name, re.I):
         return False
@@ -351,6 +357,7 @@ def find_sensitive_spans(text):
         "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
         "CASE_NUMBER": r"\bFX[-/]CIV[-/]\d{4}[-/]\d{4}\b",
         "IDENTIFIER": r"\b[A-Z]{2,4}-[A-Z]{2,4}-\d{2,6}\b",
+        "URL": r"https?://[^\s<>]+",
     }
 
     legal_entity_pattern = re.compile(
@@ -500,6 +507,8 @@ def find_sensitive_spans(text):
                 entity_text.strip(),
             ):
                 continue
+        elif len(entity_tokens) < 2:
+            continue
 
         if entity.label_ == "PERSON":
             category = "PERSON"
